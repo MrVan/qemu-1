@@ -31,10 +31,19 @@
 
 #define VHOST_USER_MEDIA_MAX_QUEUES 2
 
+#ifndef container_of
+#define container_of(ptr, type, member) \
+    ((type *)((char *)(ptr) - offsetof(type, member)))
+#endif
+
+struct vu_media_ctx;
+
 struct vu_media_device {
     VugDev dev;
     struct vhost_user_media media;
-    GMainLoop *loop;
+
+    /* Back pointer to the process-wide shared context. */
+    struct vu_media_ctx *ctx;
 
     /* Event queue state */
     VuVirtq *eventq;
@@ -53,12 +62,35 @@ struct vu_media_device {
      * Persistent command/response scratch buffers, allocated once at startup
      * and reused for every command. Sized for the worst case (an MMAP response
      * carrying VIRTIO_MEDIA_MAX_MAPPING_PAGES grant refs) so 4K buffers no
-     * longer overflow, while avoiding a malloc/free per command.
+     * longer overflow, while avoiding a malloc/free per command. One pair per
+     * device: the single-threaded GLib main loop serialises commands, but
+     * keeping them per-device avoids any cross-device coupling.
      */
     uint8_t *cmd_buf;
     size_t cmd_buf_size;
     uint8_t *resp_buf;
     size_t resp_buf_size;
+};
+
+/*
+ * Process-wide shared context. One vhost-user-media process now drives several
+ * virtio-media devices (one VuDev / socket / guest PCI device each) off a single
+ * GLib main loop, so the resources that need to exist only once - the main
+ * loop, the Xen grant device handle - live here and are shared by every device.
+ * This is what lets foreign-map accounting be coordinated across devices (the
+ * lever for capping Dom0 peak memory); see notes/single-daemon-refactor.md.
+ */
+struct vu_media_ctx {
+    GMainLoop *loop;
+
+    /*
+     * Xen grant device for dma-buf import/export, opened once and shared by
+     * every device's struct vhost_user_media (each media->gntdev_handle points
+     * here). Grant refs are domain-global, so a single handle serves all.
+     */
+    void *gntdev_handle;
+
+    GList *devices; /* struct vu_media_device * for every device */
 };
 
 /*
@@ -81,7 +113,29 @@ struct pending_event {
     uint8_t data[];
 };
 
-static struct vu_media_device vu_media;
+static struct vu_media_ctx vu_ctx;
+
+/*
+ * Recover the owning device from the libvhost-user VuDev handle passed to the
+ * VuDevIface callbacks. VugDev.parent is the embedded VuDev, and VugDev is the
+ * first member of struct vu_media_device, so a nested container_of walks back
+ * to the device.
+ */
+static inline struct vu_media_device *vu_media_from_vudev(VuDev *vudev)
+{
+    VugDev *vugdev = container_of(vudev, VugDev, parent);
+    return container_of(vugdev, struct vu_media_device, dev);
+}
+
+/*
+ * Recover the owning device from the struct vhost_user_media passed to the
+ * media-layer callbacks (send_event / register_poll).
+ */
+static inline struct vu_media_device *vu_media_from_media(
+    struct vhost_user_media *m)
+{
+    return container_of(m, struct vu_media_device, media);
+}
 
 /*
  * Try to deliver one event into an available eventq buffer.
@@ -147,7 +201,7 @@ static void vu_media_flush_pending_events(struct vu_media_device *dev)
 static void vu_media_send_event(struct vhost_user_media *m,
                                 const void *event, size_t event_len)
 {
-    struct vu_media_device *dev = &vu_media;
+    struct vu_media_device *dev = vu_media_from_media(m);
 
     /* Preserve order: if events are already pending, this one goes behind. */
     if (g_queue_is_empty(dev->pending_events) &&
@@ -168,27 +222,28 @@ static void vu_media_send_event(struct vhost_user_media *m,
  */
 static void vu_media_handle_commandq(VuDev *vudev, int qidx)
 {
+    struct vu_media_device *dev = vu_media_from_vudev(vudev);
     VuVirtq *vq = vu_get_queue(vudev, qidx);
     VuVirtqElement *elem;
 
     while ((elem = vu_queue_pop(vudev, vq, sizeof(VuVirtqElement)))) {
         /* Gather the device-readable (command) data */
-        uint8_t *cmd_buf = vu_media.cmd_buf;
+        uint8_t *cmd_buf = dev->cmd_buf;
         size_t cmd_len = 0;
         int i;
 
-        for (i = 0; i < elem->out_num && cmd_len < vu_media.cmd_buf_size; i++) {
+        for (i = 0; i < elem->out_num && cmd_len < dev->cmd_buf_size; i++) {
             size_t chunk = elem->out_sg[i].iov_len;
-            if (cmd_len + chunk > vu_media.cmd_buf_size)
-                chunk = vu_media.cmd_buf_size - cmd_len;
+            if (cmd_len + chunk > dev->cmd_buf_size)
+                chunk = dev->cmd_buf_size - cmd_len;
             memcpy(cmd_buf + cmd_len, elem->out_sg[i].iov_base, chunk);
             cmd_len += chunk;
         }
 
         /* Prepare response buffer */
-        uint8_t *resp_buf = vu_media.resp_buf;
+        uint8_t *resp_buf = dev->resp_buf;
         size_t resp_len = 0;
-        size_t resp_buf_size = vu_media.resp_buf_size;
+        size_t resp_buf_size = dev->resp_buf_size;
 
         /* Also calculate available device-writable space */
         size_t in_total = 0;
@@ -206,13 +261,13 @@ static void vu_media_handle_commandq(VuDev *vudev, int qidx)
          * across DomU recreations.
          */
         if (vudev->xen_domainid)
-            vu_media.media.domu_domid = vudev->xen_domainid;
+            dev->media.domu_domid = vudev->xen_domainid;
         /*
          * Let the command layer reach the VuDev for the shared-object APIs
          * (vu_add/rm_shared_object in handle_cmd_mmap / cleanup paths).
          */
-        vu_media.media.opaque = vudev;
-        vhost_media_process_command(&vu_media.media, cmd_buf, cmd_len,
+        dev->media.opaque = vudev;
+        vhost_media_process_command(&dev->media, cmd_buf, cmd_len,
                                     resp_buf, resp_buf_size, &resp_len);
 
         /* Write response back to device-writable descriptors */
@@ -239,7 +294,7 @@ static void vu_media_handle_commandq(VuDev *vudev, int qidx)
  */
 static void vu_media_handle_eventq(VuDev *vudev, int qidx)
 {
-    vu_media_flush_pending_events(&vu_media);
+    vu_media_flush_pending_events(vu_media_from_vudev(vudev));
 }
 
 static void vu_media_queue_set_started(VuDev *vudev, int qidx, bool started)
@@ -266,6 +321,7 @@ static void vu_media_set_features(VuDev *vudev, uint64_t features)
 
 static int vu_media_get_config(VuDev *vudev, uint8_t *config, uint32_t len)
 {
+    struct vu_media_device *dev = vu_media_from_vudev(vudev);
     struct virtio_media_config cfg;
     struct v4l2_capability cap;
     int fd;
@@ -273,7 +329,7 @@ static int vu_media_get_config(VuDev *vudev, uint8_t *config, uint32_t len)
     memset(&cfg, 0, sizeof(cfg));
 
     /* Query the V4L2 device capabilities */
-    fd = open(vu_media.media.v4l2_device, O_RDWR);
+    fd = open(dev->media.v4l2_device, O_RDWR);
     if (fd >= 0) {
         if (ioctl(fd, VIDIOC_QUERYCAP, &cap) == 0) {
             cfg.device_caps = cap.device_caps;
@@ -309,8 +365,8 @@ static int vu_media_set_config(VuDev *vudev, const uint8_t *data,
 static void vu_media_panic(VuDev *vudev, const char *msg)
 {
     g_critical("vhost-user-media panic: %s", msg);
-    if (vu_media.loop)
-        g_main_loop_quit(vu_media.loop);
+    if (vu_ctx.loop)
+        g_main_loop_quit(vu_ctx.loop);
 }
 
 /*
@@ -326,20 +382,59 @@ static uint64_t vu_media_get_protocol_features(VuDev *vudev)
 }
 
 /*
+ * Search every device in this process for a live buffer carrying `uuid` and
+ * return its owning device's dma_fd (NOT dup'd; the caller must not close it),
+ * or -1 if none has it. Shared by the QEMU-facing producer callback and the
+ * consumer-side local fast path.
+ */
+static int vu_ctx_lookup_shared_object(const uint8_t *uuid)
+{
+    GList *l;
+
+    for (l = vu_ctx.devices; l; l = l->next) {
+        struct vu_media_device *dev = l->data;
+        int fd = vhost_media_lookup_shared_object(&dev->media, uuid);
+
+        if (fd >= 0)
+            return fd;
+    }
+    return -1;
+}
+
+/*
  * Producer side of the host-object handoff: QEMU asks us (via
  * GET_SHARED_OBJECT) for the fd behind a UUID we registered with
  * vu_add_shared_object when the host buffer was exported. Return the owning
  * entry's dma_fd; libvhost-user duplicates it over SCM_RIGHTS to the
  * requesting consumer daemon, so we must NOT close it here (its lifetime is
  * the MMAP entry's). Returns -1 if no live buffer carries this UUID.
+ *
+ * With several devices in one process the UUID may have been registered by a
+ * different device than the one QEMU routed this request to (e.g. the decoder
+ * produced the buffer, the encoder consumes it), so search every device's
+ * media until one resolves the UUID.
  */
 static int vu_media_get_shared_object(VuDev *vudev, const unsigned char *uuid)
 {
-    int fd = vhost_media_lookup_shared_object(&vu_media.media, uuid);
+    int fd = vu_ctx_lookup_shared_object(uuid);
 
     if (fd < 0)
         g_warning("get_shared_object: no live buffer for requested UUID");
     return fd;
+}
+
+/*
+ * Consumer-side local fast path (media-level local_lookup callback): resolve a
+ * UUID against buffers exported by any device in this process, in-address-space,
+ * so a consumer (e.g. encoder) never issues the synchronous cross-process RPC
+ * for a producer (e.g. decoder) that lives in this same daemon -- which would
+ * deadlock the shared main loop. Returns the producer's dma_fd (caller dup's
+ * it) or -1 on a local miss (the producer is another process; RPC is safe).
+ */
+static int vu_media_local_lookup(struct vhost_user_media *m,
+                                 const uint8_t uuid[16])
+{
+    return vu_ctx_lookup_shared_object(uuid);
 }
 
 static const VuDevIface vuiface = {
@@ -361,7 +456,7 @@ session_poll_callback(gint fd, GIOCondition condition,
 {
     struct media_session *s = user_data;
 
-    vhost_media_poll_session(&vu_media.media, s, condition);
+    vhost_media_poll_session(s->media, s, condition);
     return G_SOURCE_CONTINUE;
 }
 
@@ -386,21 +481,202 @@ static gboolean hangup(gpointer data)
     return TRUE;
 }
 
+/*
+ * Bring up one device: allocate its state, take ownership of the connected
+ * socket, wire the media callbacks and shared grant handle, and hand the socket
+ * to libvhost-user. On success the device is appended to ctx->devices and 0 is
+ * returned; on failure everything allocated here is torn down and -1 returned.
+ */
+static int vu_media_device_new(struct vu_media_ctx *ctx,
+                               const char *v4l2_device, int socket_fd)
+{
+    struct vu_media_device *dev = g_new0(struct vu_media_device, 1);
+
+    dev->ctx = ctx;
+    dev->media.v4l2_device = g_strdup(v4l2_device);
+    dev->media.send_event = vu_media_send_event;
+    dev->media.register_poll = vu_media_register_poll;
+    dev->media.local_lookup = vu_media_local_lookup;
+    /* Every device shares the one process-wide Xen grant device handle. */
+    dev->media.gntdev_handle = ctx->gntdev_handle;
+
+    dev->pending_events = g_queue_new();
+
+    /* Per-device persistent command/response scratch buffers. */
+    dev->cmd_buf_size = VU_MEDIA_CMD_BUF_SIZE;
+    dev->cmd_buf = g_malloc(dev->cmd_buf_size);
+    dev->resp_buf_size = VU_MEDIA_RESP_BUF_SIZE;
+    dev->resp_buf = g_malloc(dev->resp_buf_size);
+
+    /*
+     * vug_init takes ownership of socket_fd: vu_deinit (via vug_deinit in
+     * vu_media_device_free) closes it. The fd is our own (dup'd out of the
+     * transient GSocket by the caller), so this is the single owner.
+     */
+    if (!vug_init(&dev->dev, VHOST_USER_MEDIA_MAX_QUEUES,
+                  socket_fd, vu_media_panic, &vuiface)) {
+        g_printerr("Failed to initialize libvhost-user-glib for %s\n",
+                   v4l2_device);
+        close(socket_fd);
+        g_free(dev->cmd_buf);
+        g_free(dev->resp_buf);
+        g_queue_free(dev->pending_events);
+        g_free(dev->media.v4l2_device);
+        g_free(dev);
+        return -1;
+    }
+
+    ctx->devices = g_list_append(ctx->devices, dev);
+    g_message("vhost-user-media: device=%s ready", v4l2_device);
+    return 0;
+}
+
+/*
+ * Tear down one device: destroy its sessions, drain its grant-release pool,
+ * deinit libvhost-user and free its buffers. The shared grant handle lives in
+ * the ctx and is closed once, after all devices are gone.
+ */
+static void vu_media_device_free(struct vu_media_device *dev)
+{
+    while (dev->media.sessions) {
+        struct media_session *s = dev->media.sessions->data;
+        vhost_media_destroy_session(&dev->media, s);
+    }
+
+    /* Drain and free the grant-release worker pool (waits for pending jobs) */
+    if (dev->media.grant_release_pool)
+        g_thread_pool_free(dev->media.grant_release_pool, FALSE, TRUE);
+
+    vug_deinit(&dev->dev);
+
+    while (!g_queue_is_empty(dev->pending_events))
+        g_free(g_queue_pop_head(dev->pending_events));
+    g_queue_free(dev->pending_events);
+
+    g_free(dev->cmd_buf);
+    g_free(dev->resp_buf);
+    g_free(dev->media.v4l2_device);
+    g_free(dev);
+}
+
+/*
+ * Dup the fd out of a transient GSocket so its lifetime is independent of the
+ * wrapper (which is unref'd by the caller, closing its own copy). The returned
+ * fd is owned by the caller and ultimately closed by vug_deinit.
+ */
+static int vu_media_dup_socket_fd(GSocket *socket)
+{
+    int fd = dup(g_socket_get_fd(socket));
+
+    if (fd < 0)
+        g_printerr("Failed to dup socket fd: %m\n");
+    return fd;
+}
+
+/*
+ * Bind + listen a Unix socket path. Returns the listening GSocket (owned by the
+ * caller) or NULL on failure. Kept separate from accept so that, with multiple
+ * devices, every socket node is created up front: the client (QEMU) connects to
+ * all of them before we block in accept. Binding and accepting one device at a
+ * time would leave later sockets non-existent, and QEMU would fail to connect.
+ */
+static GSocket *vu_media_listen(const char *socket_path)
+{
+    g_autoptr(GError) error = NULL;
+    g_autoptr(GSocketAddress) addr = g_unix_socket_address_new(socket_path);
+    GSocket *bind_socket =
+        g_socket_new(G_SOCKET_FAMILY_UNIX, G_SOCKET_TYPE_STREAM,
+                     G_SOCKET_PROTOCOL_DEFAULT, &error);
+
+    if (!bind_socket) {
+        g_printerr("Failed to create socket for %s: %s\n",
+                   socket_path, error ? error->message : "unknown error");
+        return NULL;
+    }
+    if (!g_socket_bind(bind_socket, addr, false, &error)) {
+        g_printerr("Failed to bind to %s: %s\n", socket_path, error->message);
+        g_object_unref(bind_socket);
+        return NULL;
+    }
+    if (!g_socket_listen(bind_socket, &error)) {
+        g_printerr("Failed to listen on %s: %s\n",
+                   socket_path, error->message);
+        g_object_unref(bind_socket);
+        return NULL;
+    }
+    g_message("Listening on %s", socket_path);
+    return bind_socket;
+}
+
+/*
+ * Accept a connection on a listening socket. Returns a connected fd (owned by
+ * the caller, to be handed to vug_init) or -1 on failure.
+ */
+static int vu_media_accept(GSocket *listen_socket)
+{
+    g_autoptr(GError) error = NULL;
+    g_autoptr(GSocket) socket = g_socket_accept(listen_socket, NULL, &error);
+
+    if (!socket) {
+        g_printerr("Failed to accept connection: %s\n",
+                   error ? error->message : "unknown error");
+        return -1;
+    }
+    return vu_media_dup_socket_fd(socket);
+}
+
+/*
+ * Wrap an inherited (already connected) socket fd. Returns a connected fd
+ * (owned by the caller, to be handed to vug_init) or -1 on failure.
+ */
+static int vu_media_wrap_fd(int socket_fd)
+{
+    g_autoptr(GError) error = NULL;
+    g_autoptr(GSocket) socket = g_socket_new_from_fd(socket_fd, &error);
+
+    if (!socket) {
+        g_printerr("Failed to wrap socket fd %d: %s\n",
+                   socket_fd, error ? error->message : "unknown error");
+        return -1;
+    }
+    return vu_media_dup_socket_fd(socket);
+}
+
+/*
+ * Return TRUE if the string array contains a repeated value, storing the index
+ * of the first duplicate in *dup_idx. Used to reject ambiguous CLI pairings.
+ */
+static gboolean strv_has_duplicate(GStrv strv, guint *dup_idx)
+{
+    guint i, j;
+
+    for (i = 0; strv && strv[i]; i++) {
+        for (j = 0; j < i; j++) {
+            if (g_strcmp0(strv[i], strv[j]) == 0) {
+                *dup_idx = i;
+                return TRUE;
+            }
+        }
+    }
+    return FALSE;
+}
+
 int main(int argc, char *argv[])
 {
     g_autoptr(GError) error = NULL;
-    g_autoptr(GSocket) socket = NULL;
-    char *socket_path = NULL;
-    char *v4l2_device = NULL;
-    int socket_fd = -1;
+    g_auto(GStrv) v4l2_devices = NULL;
+    g_auto(GStrv) socket_paths = NULL;
+    g_auto(GStrv) socket_fds = NULL;
+    GSocket **listen_sockets = NULL;
+    guint n_devices, n_paths, n_fds, i;
 
     GOptionEntry entries[] = {
-        { "socket-path", 's', 0, G_OPTION_ARG_STRING, &socket_path,
-          "Unix socket path", "PATH" },
-        { "socket-fd", 'f', 0, G_OPTION_ARG_INT, &socket_fd,
-          "Unix socket fd", "FD" },
-        { "v4l2-device", 'd', 0, G_OPTION_ARG_STRING, &v4l2_device,
-          "V4L2 device path", "PATH" },
+        { "socket-path", 's', 0, G_OPTION_ARG_STRING_ARRAY, &socket_paths,
+          "Unix socket path (repeat once per device)", "PATH" },
+        { "socket-fd", 'f', 0, G_OPTION_ARG_STRING_ARRAY, &socket_fds,
+          "Unix socket fd (repeat once per device)", "FD" },
+        { "v4l2-device", 'd', 0, G_OPTION_ARG_STRING_ARRAY, &v4l2_devices,
+          "V4L2 device path (repeat once per device)", "PATH" },
         { NULL }
     };
 
@@ -412,105 +688,124 @@ int main(int argc, char *argv[])
         exit(EXIT_FAILURE);
     }
 
-    if (!v4l2_device) {
+    n_devices = v4l2_devices ? g_strv_length(v4l2_devices) : 0;
+    n_paths = socket_paths ? g_strv_length(socket_paths) : 0;
+    n_fds = socket_fds ? g_strv_length(socket_fds) : 0;
+
+    if (n_devices == 0) {
         g_printerr("Must specify --v4l2-device\n");
         exit(EXIT_FAILURE);
     }
 
-    if (!socket_path && socket_fd < 0) {
+    /*
+     * Each device needs exactly one socket, paired by position. Sockets may be
+     * given all as paths or all as fds, but not a mix (the pairing would be
+     * ambiguous). The socket count must match the device count.
+     */
+    if (n_paths && n_fds) {
+        g_printerr("Use either --socket-path or --socket-fd, not both\n");
+        exit(EXIT_FAILURE);
+    }
+    if (n_paths + n_fds == 0) {
         g_printerr("Must specify --socket-path or --socket-fd\n");
         exit(EXIT_FAILURE);
     }
+    if (n_paths + n_fds != n_devices) {
+        g_printerr("Number of sockets (%u) must match number of "
+                   "--v4l2-device (%u)\n", n_paths + n_fds, n_devices);
+        exit(EXIT_FAILURE);
+    }
 
-    /* Initialize the media device state */
-    memset(&vu_media, 0, sizeof(vu_media));
-    vu_media.media.v4l2_device = v4l2_device;
-    vu_media.media.send_event = vu_media_send_event;
-    vu_media.media.register_poll = vu_media_register_poll;
+    /*
+     * Reject duplicate v4l2 nodes or sockets. Two devices sharing a v4l2 node
+     * would open the same hardware twice, and two devices sharing a socket
+     * would collide on bind/connect -- both are configuration mistakes that
+     * position-paired flags cannot express meaningfully.
+     */
+    if (strv_has_duplicate(v4l2_devices, &i)) {
+        g_printerr("Duplicate --v4l2-device: %s\n", v4l2_devices[i]);
+        exit(EXIT_FAILURE);
+    }
+    if (n_paths && strv_has_duplicate(socket_paths, &i)) {
+        g_printerr("Duplicate --socket-path: %s\n", socket_paths[i]);
+        exit(EXIT_FAILURE);
+    }
+    if (n_fds && strv_has_duplicate(socket_fds, &i)) {
+        g_printerr("Duplicate --socket-fd: %s\n", socket_fds[i]);
+        exit(EXIT_FAILURE);
+    }
 
-    vu_media.pending_events = g_queue_new();
+    memset(&vu_ctx, 0, sizeof(vu_ctx));
 
-    /* Allocate the persistent command/response scratch buffers once. */
-    vu_media.cmd_buf_size = VU_MEDIA_CMD_BUF_SIZE;
-    vu_media.cmd_buf = g_malloc(vu_media.cmd_buf_size);
-    vu_media.resp_buf_size = VU_MEDIA_RESP_BUF_SIZE;
-    vu_media.resp_buf = g_malloc(vu_media.resp_buf_size);
-
-    /* Open Xen grant device for dma-buf import/export */
-    vu_media.media.gntdev_handle = xengnttab_open(NULL, 0);
-    if (!vu_media.media.gntdev_handle) {
+    /* Open the Xen grant device once; every device shares this handle. */
+    vu_ctx.gntdev_handle = xengnttab_open(NULL, 0);
+    if (!vu_ctx.gntdev_handle) {
         g_printerr("Failed to open xengnttab device\n");
         exit(EXIT_FAILURE);
     }
 
-    /* Set up the socket */
-    if (socket_path) {
-        g_autoptr(GSocketAddress) addr =
-            g_unix_socket_address_new(socket_path);
-        g_autoptr(GSocket) bind_socket =
-            g_socket_new(G_SOCKET_FAMILY_UNIX, G_SOCKET_TYPE_STREAM,
-                         G_SOCKET_PROTOCOL_DEFAULT, &error);
+    /* Shared main loop for every device. */
+    vu_ctx.loop = g_main_loop_new(NULL, FALSE);
+    g_unix_signal_add(SIGHUP, hangup, vu_ctx.loop);
+    g_unix_signal_add(SIGINT, hangup, vu_ctx.loop);
 
-        if (!g_socket_bind(bind_socket, addr, false, &error)) {
-            g_printerr("Failed to bind to %s: %s\n",
-                       socket_path, error->message);
-            exit(EXIT_FAILURE);
-        }
-        if (!g_socket_listen(bind_socket, &error)) {
-            g_printerr("Failed to listen on %s: %s\n",
-                       socket_path, error->message);
-            exit(EXIT_FAILURE);
-        }
-        g_message("Awaiting connection on %s", socket_path);
-        socket = g_socket_accept(bind_socket, NULL, &error);
-        if (!socket) {
-            g_printerr("Failed to accept: %s\n", error->message);
-            exit(EXIT_FAILURE);
-        }
-    } else {
-        socket = g_socket_new_from_fd(socket_fd, &error);
-        if (!socket) {
-            g_printerr("Failed to create socket from fd %d: %s\n",
-                       socket_fd, error->message);
-            exit(EXIT_FAILURE);
+    /*
+     * Phase 1 (path mode only): bind + listen every socket up front so all
+     * socket nodes exist before we block accepting any one of them. A single
+     * daemon accepts sequentially, so binding lazily per-device would leave
+     * later sockets missing and QEMU's connect to them would fail.
+     */
+    if (n_paths) {
+        listen_sockets = g_new0(GSocket *, n_paths);
+        for (i = 0; i < n_paths; i++) {
+            listen_sockets[i] = vu_media_listen(socket_paths[i]);
+            if (!listen_sockets[i])
+                exit(EXIT_FAILURE);
         }
     }
 
-    /* Create main loop */
-    vu_media.loop = g_main_loop_new(NULL, FALSE);
-    g_unix_signal_add(SIGHUP, hangup, vu_media.loop);
-    g_unix_signal_add(SIGINT, hangup, vu_media.loop);
+    /* Bring up each device: connect its socket, then init libvhost-user. */
+    for (i = 0; i < n_devices; i++) {
+        int fd;
 
-    /* Initialize vhost-user-glib */
-    if (!vug_init(&vu_media.dev, VHOST_USER_MEDIA_MAX_QUEUES,
-                  g_socket_get_fd(socket), vu_media_panic, &vuiface)) {
-        g_printerr("Failed to initialize libvhost-user-glib\n");
-        exit(EXIT_FAILURE);
+        if (n_paths) {
+            /*
+             * Two-phase for path mode: every socket has already been bound and
+             * put into listen state above, so all nodes exist on the
+             * filesystem before we block in accept. QEMU connects to all of
+             * them; we accept them one at a time here.
+             */
+            fd = vu_media_accept(listen_sockets[i]);
+        } else {
+            fd = vu_media_wrap_fd(atoi(socket_fds[i]));
+        }
+
+        if (fd < 0) {
+            g_printerr("Failed to connect socket for %s\n", v4l2_devices[i]);
+            exit(EXIT_FAILURE);
+        }
+        if (vu_media_device_new(&vu_ctx, v4l2_devices[i], fd) < 0)
+            exit(EXIT_FAILURE);
     }
 
-    g_message("vhost-user-media: device=%s, entering main loop", v4l2_device);
+    /* Listening sockets are no longer needed once every device is accepted. */
+    for (i = 0; i < n_paths; i++)
+        g_object_unref(listen_sockets[i]);
+    g_free(listen_sockets);
 
-    g_main_loop_run(vu_media.loop);
+    g_message("vhost-user-media: %u device(s), entering main loop", n_devices);
+
+    g_main_loop_run(vu_ctx.loop);
 
     g_message("Main loop exited, cleaning up");
-    g_main_loop_unref(vu_media.loop);
+    g_main_loop_unref(vu_ctx.loop);
 
-    /* Cleanup sessions */
-    while (vu_media.media.sessions) {
-        struct media_session *s = vu_media.media.sessions->data;
-        vhost_media_destroy_session(&vu_media.media, s);
-    }
+    /* Tear down every device before closing the shared grant handle. */
+    g_list_free_full(vu_ctx.devices, (GDestroyNotify)vu_media_device_free);
 
-    /* Drain and free the grant-release worker pool (waits for pending jobs) */
-    if (vu_media.media.grant_release_pool)
-        g_thread_pool_free(vu_media.media.grant_release_pool, FALSE, TRUE);
-
-    /* Close Xen grant device */
-    if (vu_media.media.gntdev_handle)
-        xengnttab_close(vu_media.media.gntdev_handle);
-
-    g_free(vu_media.cmd_buf);
-    g_free(vu_media.resp_buf);
+    /* Close the shared Xen grant device */
+    if (vu_ctx.gntdev_handle)
+        xengnttab_close(vu_ctx.gntdev_handle);
 
     return 0;
 }

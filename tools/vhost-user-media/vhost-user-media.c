@@ -518,15 +518,16 @@ static int dmabuf_resolve_resource(struct media_session *s,
  * The cache owns the fd; it is closed on the queue's STREAMOFF (see
  * uuid_fd_cache_clear()) or session close. The caller must NOT close it.
  *
- * CONSTRAINT: the miss path is a nested synchronous RPC that blocks this
- * daemon's main loop until the producer replies (consumer backend channel ->
- * QEMU -> producer main channel -> producer). It therefore assumes the
- * producer and consumer of a given host dma-buf are DIFFERENT daemon
- * processes. A single daemon that both exported a UUID and consumes it would
- * deadlock: it would block here waiting for a reply it must itself service on
- * the same (now blocked) main loop. The current split (a dedicated encoder
- * daemon and decoder daemon) satisfies this; do not collapse a producer and
- * its consumer into one process.
+ * CONSTRAINT: the cross-process miss path is a nested synchronous RPC that
+ * blocks this daemon's main loop until the producer replies (consumer backend
+ * channel -> QEMU -> producer main channel -> producer). It therefore assumes
+ * the producer and consumer of a given host dma-buf are DIFFERENT daemon
+ * processes. When they live in ONE daemon (single-daemon multi-device), that
+ * RPC would self-deadlock: the loop would block here waiting for a reply it
+ * must itself service on the same (now blocked) loop. That case is handled
+ * BEFORE the RPC by m->local_lookup, which resolves the UUID against the other
+ * devices' exports directly in this address space; the RPC is reached only on a
+ * local miss, i.e. only when the producer really is another process.
  */
 static int uuid_resolve_host_fd(struct vhost_user_media *m,
                                 struct media_session *s,
@@ -542,10 +543,31 @@ static int uuid_resolve_host_fd(struct vhost_user_media *m,
             return uf->host_fd;
     }
 
-    if (!m->opaque ||
-        !vu_lookup_shared_object((VuDev *)m->opaque, (unsigned char *)uuid,
-                                 &host_fd) ||
-        host_fd < 0) {
+    /*
+     * Local first: if another device in this process exports the UUID, its
+     * dma-buf fd is reachable here directly. dup() it so this consumer owns an
+     * independent fd (closed on STREAMOFF/session close via uuid_fd_cache_clear)
+     * without disturbing the producer's original, mirroring the SCM_RIGHTS dup
+     * the cross-process path performs. Only on a local miss do we fall back to
+     * the synchronous cross-process RPC (safe then: the producer is elsewhere).
+     */
+    if (m->local_lookup) {
+        int producer_fd = m->local_lookup(m, uuid);
+
+        if (producer_fd >= 0) {
+            host_fd = dup(producer_fd);
+            if (host_fd < 0) {
+                g_warning("uuid_resolve_host_fd: dup of local fd failed: %m");
+                return -1;
+            }
+        }
+    }
+
+    if (host_fd < 0 &&
+        (!m->opaque ||
+         !vu_lookup_shared_object((VuDev *)m->opaque, (unsigned char *)uuid,
+                                  &host_fd) ||
+         host_fd < 0)) {
         return -1;
     }
 

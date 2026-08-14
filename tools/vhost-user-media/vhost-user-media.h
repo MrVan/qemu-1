@@ -134,6 +134,19 @@ typedef void (*register_poll_fn)(struct vhost_user_media *m,
                                  struct media_session *s);
 
 /*
+ * Callback type for resolving a shared-object UUID against buffers exported by
+ * OTHER devices in the same daemon process. With several devices in one process
+ * (e.g. a decoder producing frames an encoder consumes) the producer's host
+ * dma-buf can be found locally, in the same address space, without asking QEMU.
+ *
+ * Returns a live dma-buf fd owned by the producing device (the caller must
+ * dup() it before taking ownership; it must NOT close the returned fd), or -1
+ * if no device in this process currently exports the UUID.
+ */
+typedef int (*local_lookup_fn)(struct vhost_user_media *m,
+                               const uint8_t uuid[16]);
+
+/*
  * Main vhost-user-media device state.
  */
 struct vhost_user_media {
@@ -162,6 +175,16 @@ struct vhost_user_media {
 
     /* Session poll registration callback (set by the vhost-user glue) */
     register_poll_fn register_poll;
+
+    /*
+     * Cross-device local shared-object lookup (set by the vhost-user glue).
+     * Lets a consumer resolve a UUID against buffers exported by other devices
+     * in this same process before falling back to the synchronous cross-process
+     * RPC (vu_lookup_shared_object). This both avoids that RPC's cost and, when
+     * producer and consumer live in one daemon, avoids the self-deadlock the RPC
+     * would cause (see uuid_resolve_host_fd()). NULL in a single-device daemon.
+     */
+    local_lookup_fn local_lookup;
 
     /* Opaque pointer for the vhost-user glue layer */
     void *opaque;
