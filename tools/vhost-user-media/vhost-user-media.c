@@ -89,30 +89,6 @@ static void media_generate_uuid(uint8_t uuid[16])
 }
 
 /*
- * Resolve a shared-object UUID to the local dma-buf fd exported under it.
- * Scans every session's MMAP entries (including stale ones, whose dma_fd is
- * still open until the matching MUNMAP). Returns dma_fd (>= 0) or -1.
- *
- * A linear scan is fine: this runs only on a consumer cache miss (first frame
- * per buffer / after a source change), never per queued frame.
- */
-int vhost_media_lookup_shared_object(struct vhost_user_media *m,
-                                     const uint8_t uuid[16])
-{
-    for (GList *sl = m->sessions; sl != NULL; sl = sl->next) {
-        struct media_session *s = sl->data;
-
-        for (GList *l = s->mmaps; l != NULL; l = l->next) {
-            struct media_mmap_entry *entry = l->data;
-
-            if (memcmp(entry->uuid, uuid, 16) == 0)
-                return entry->dma_fd;
-        }
-    }
-    return -1;
-}
-
-/*
  * Undo the vu_add_shared_object() done for a host dma-buf when its entry is
  * freed. No-op if the entry carries an all-zero UUID (registration never
  * succeeded). The UUID is cleared afterwards so a double free cannot re-issue
@@ -126,9 +102,32 @@ static void vhost_media_unregister_shared_object(struct vhost_user_media *m,
     if (memcmp(entry->uuid, zero_uuid, 16) == 0)
         return;
 
+    /*
+     * Drop the process-wide registry entry BEFORE the caller releases/closes
+     * the dma-buf fd, so a concurrent consumer local_lookup() either dup()s a
+     * still-open fd or misses cleanly.
+     */
+    if (m->shared_unregister)
+        m->shared_unregister(m, entry->uuid);
+
     if (m->opaque)
         vu_rm_shared_object((VuDev *)m->opaque, entry->uuid);
     memset(entry->uuid, 0, sizeof(entry->uuid));
+}
+
+/*
+ * Tear down a session's V4L2 fd poll source, if registered. The source was
+ * created with g_unix_fd_source_new() and attached to the owning device's
+ * GMainContext, so it must be destroyed and unref-ed (not g_source_remove()d,
+ * which only works for sources on the default context).
+ */
+static void session_clear_poll(struct media_session *s)
+{
+    if (s->poll_source) {
+        g_source_destroy(s->poll_source);
+        g_source_unref(s->poll_source);
+        s->poll_source = NULL;
+    }
 }
 
 /*
@@ -141,7 +140,7 @@ static void vhost_media_unregister_shared_object(struct vhost_user_media *m,
 static void maybe_register_poll(struct vhost_user_media *m,
                                 struct media_session *s)
 {
-    if (s->poll_source_id)
+    if (s->poll_source)
         return;
     if (!s->output_streaming || !s->output_qbuf_done)
         return;
@@ -167,7 +166,7 @@ static struct media_session *create_session(struct vhost_user_media *m)
     s->id = next_session_id++;
     s->v4l2_fd = fd;
     s->media = m;
-    s->poll_source_id = 0;
+    s->poll_source = NULL;
     /*
      * Queues default to MMAP (host owns the buffers). REQBUFS switches a queue
      * to DMABUF when the guest requests it and the export path is usable.
@@ -201,10 +200,7 @@ void vhost_media_destroy_session(struct vhost_user_media *m,
     g_debug("Destroying session %u", s->id);
 
     /* Remove poll source */
-    if (s->poll_source_id) {
-        g_source_remove(s->poll_source_id);
-        s->poll_source_id = 0;
-    }
+    session_clear_poll(s);
 
     /* Release all MMAP buffer grant refs for this session (off main loop) */
     for (GList *l = s->mmaps; l != NULL; l = l->next) {
@@ -544,23 +540,16 @@ static int uuid_resolve_host_fd(struct vhost_user_media *m,
     }
 
     /*
-     * Local first: if another device in this process exports the UUID, its
-     * dma-buf fd is reachable here directly. dup() it so this consumer owns an
-     * independent fd (closed on STREAMOFF/session close via uuid_fd_cache_clear)
-     * without disturbing the producer's original, mirroring the SCM_RIGHTS dup
-     * the cross-process path performs. Only on a local miss do we fall back to
-     * the synchronous cross-process RPC (safe then: the producer is elsewhere).
+     * Local first: if another device in this process exports the UUID,
+     * m->local_lookup resolves it against that device's exports under the
+     * process-wide registry lock and returns a NEW fd already dup()ed while the
+     * producer's fd was guaranteed open. This consumer owns it (closed on
+     * STREAMOFF/session close via uuid_fd_cache_clear) and must not dup again.
+     * Only on a local miss do we fall back to the synchronous cross-process RPC
+     * (safe then: the producer is elsewhere).
      */
     if (m->local_lookup) {
-        int producer_fd = m->local_lookup(m, uuid);
-
-        if (producer_fd >= 0) {
-            host_fd = dup(producer_fd);
-            if (host_fd < 0) {
-                g_warning("uuid_resolve_host_fd: dup of local fd failed: %m");
-                return -1;
-            }
-        }
+        host_fd = m->local_lookup(m, uuid);
     }
 
     if (host_fd < 0 &&
@@ -1529,6 +1518,14 @@ static void handle_cmd_mmap(struct vhost_user_media *m,
                   "(SHARED_OBJECT not negotiated?); UUID handoff disabled "
                   "for this buffer", offset);
         memset(entry->uuid, 0, sizeof(entry->uuid));
+    } else if (m->shared_register) {
+        /*
+         * Publish UUID -> dma_fd in the process-wide registry so a consumer
+         * device in this same daemon can resolve it locally (and thread-safely)
+         * without the synchronous cross-process RPC. Unpublished in
+         * vhost_media_unregister_shared_object() before dma_fd is released.
+         */
+        m->shared_register(m, entry->uuid, entry->dma_fd);
     }
 
     g_debug("MMAP: offset=0x%x -> grant_ref=%u count=%u len=%u (buf %u plane %u)",
@@ -1897,11 +1894,10 @@ void vhost_media_poll_session(struct vhost_user_media *m,
 
     if (events & G_IO_IN) {
         enum drain_result r = drain_capture_queue(m, s);
-        if (r == DRAIN_COMPLETE && s->poll_source_id) {
+        if (r == DRAIN_COMPLETE && s->poll_source) {
             /* Drain finished on a normal readable poll. */
             g_message("Session %u: CAPTURE drain complete (EPIPE)", s->id);
-            g_source_remove(s->poll_source_id);
-            s->poll_source_id = 0;
+            session_clear_poll(s);
         } else if (r == DRAIN_ERROR) {
             g_warning("Session %u: CAPTURE DQBUF error: %s",
                       s->id, strerror(errno));
@@ -1984,9 +1980,8 @@ void vhost_media_poll_session(struct vhost_user_media *m,
          * so drop the poll source to avoid a GLib busy-loop that starves the
          * command queue.  It is re-registered on the next QBUF.
          */
-        if (s->poll_source_id) {
-            g_source_remove(s->poll_source_id);
-            s->poll_source_id = 0;
+        if (s->poll_source) {
+            session_clear_poll(s);
         }
     }
 }

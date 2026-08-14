@@ -95,7 +95,7 @@ struct media_session {
     int v4l2_fd;             /* File descriptor to the V4L2 device */
     GList *mmaps;            /* List of media_mmap_entry */
     struct vhost_user_media *media; /* Back pointer */
-    guint poll_source_id;    /* GLib source ID for fd polling (0 if none) */
+    GSource *poll_source;    /* GLib source for fd polling (NULL if none) */
     bool output_streaming;   /* OUTPUT (bitstream) queue has been STREAMON */
     bool output_qbuf_done;   /* At least one buffer QBUF-ed on OUTPUT queue */
 
@@ -139,12 +139,29 @@ typedef void (*register_poll_fn)(struct vhost_user_media *m,
  * (e.g. a decoder producing frames an encoder consumes) the producer's host
  * dma-buf can be found locally, in the same address space, without asking QEMU.
  *
- * Returns a live dma-buf fd owned by the producing device (the caller must
- * dup() it before taking ownership; it must NOT close the returned fd), or -1
- * if no device in this process currently exports the UUID.
+ * With one main loop per device (each running in its own thread), the producer
+ * may add or drop buffers concurrently with this consumer-side lookup, so the
+ * glue resolves the UUID against a process-wide registry under a lock and, while
+ * still holding it, dup()s the producer's fd. It therefore returns a NEW fd
+ * OWNED by the caller (the caller must close() it and must NOT dup() it again),
+ * or -1 if no device in this process currently exports the UUID.
  */
 typedef int (*local_lookup_fn)(struct vhost_user_media *m,
                                const uint8_t uuid[16]);
+
+/*
+ * Callback types for (un)publishing a locally-exported dma-buf in the
+ * process-wide UUID registry the consumer-side local_lookup() consults. The
+ * producing device registers the mapping when it exports a buffer (MMAP) and
+ * unregisters it before the fd is released (MUNMAP / session teardown). The
+ * registry does not take ownership of dma_fd; it only records it, and any fd
+ * returned by local_lookup() is a dup(), so unregister must run before the
+ * producer closes dma_fd.
+ */
+typedef void (*shared_register_fn)(struct vhost_user_media *m,
+                                   const uint8_t uuid[16], int dma_fd);
+typedef void (*shared_unregister_fn)(struct vhost_user_media *m,
+                                     const uint8_t uuid[16]);
 
 /*
  * Main vhost-user-media device state.
@@ -185,6 +202,15 @@ struct vhost_user_media {
      * would cause (see uuid_resolve_host_fd()). NULL in a single-device daemon.
      */
     local_lookup_fn local_lookup;
+
+    /*
+     * Process-wide shared-object registry hooks (set by the vhost-user glue).
+     * The producing device publishes each exported buffer's UUID -> dma-buf fd
+     * so that a consumer device's local_lookup() can find it across devices in
+     * a thread-safe way. NULL in a single-device daemon.
+     */
+    shared_register_fn shared_register;
+    shared_unregister_fn shared_unregister;
 
     /* Opaque pointer for the vhost-user glue layer */
     void *opaque;
@@ -236,15 +262,5 @@ void vhost_media_poll_session(struct vhost_user_media *m,
  * Ioctl code lookup.
  */
 unsigned long virtio_media_code_to_ioctl(uint32_t code);
-
-/*
- * Resolve a shared-object UUID to the local dma-buf fd of the host buffer
- * exported under it (host-object model). Returns the fd (>= 0) owned by the
- * matching media_mmap_entry, or -1 if no live entry carries this UUID. The
- * caller must not close the returned fd; libvhost-user duplicates it over
- * SCM_RIGHTS to the requesting consumer daemon.
- */
-int vhost_media_lookup_shared_object(struct vhost_user_media *m,
-                                     const uint8_t uuid[16]);
 
 #endif /* VHOST_USER_MEDIA_H */

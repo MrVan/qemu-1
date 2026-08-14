@@ -70,27 +70,71 @@ struct vu_media_device {
     size_t cmd_buf_size;
     uint8_t *resp_buf;
     size_t resp_buf_size;
+
+    /*
+     * Per-device event loop. Each device runs its own GMainContext + GMainLoop
+     * on a dedicated thread so that one device stalling or panicking (e.g. a
+     * wedged V4L2 fd, or a synchronous shared-object RPC) cannot block the
+     * others: the loops are fully independent. All GSources for a device (the
+     * vhost-user socket, the vring kick fds, the V4L2 poll source) are attached
+     * to this context, and only this device's thread ever runs it.
+     */
+    GMainContext *context;
+    GMainLoop *loop;
+    GThread *thread;
+
+    /* Connected socket fd handed to vug_init inside the device thread. */
+    int socket_fd;
+
+    /*
+     * Startup handshake. vug_init must run in the device thread (so its
+     * GSources attach to that thread's default context, i.e. dev->context),
+     * but main() needs to know whether it succeeded before moving on. The
+     * thread signals init_done/init_ok once vug_init has been attempted.
+     */
+    GMutex init_lock;
+    GCond init_cond;
+    gboolean init_done;
+    gboolean init_ok;
+
+    /* Set true once vug_init succeeded; gates vug_deinit at teardown. */
+    gboolean initialized;
+
+    /* Set by the panic callback; the device's loop has been asked to quit. */
+    gboolean panicked;
 };
 
 /*
- * Process-wide shared context. One vhost-user-media process now drives several
- * virtio-media devices (one VuDev / socket / guest PCI device each) off a single
- * GLib main loop, so the resources that need to exist only once - the main
- * loop, the Xen grant device handle - live here and are shared by every device.
- * This is what lets foreign-map accounting be coordinated across devices (the
- * lever for capping Dom0 peak memory); see notes/single-daemon-refactor.md.
+ * Process-wide shared context. One vhost-user-media process drives several
+ * virtio-media devices (one VuDev / socket / guest PCI device each). Each device
+ * runs its own GMainContext + GMainLoop on its own thread for fault isolation
+ * (see struct vu_media_device), so this context holds only what is genuinely
+ * shared across devices: the controlling main loop (for signals and lifetime),
+ * the device list, and the cross-device shared-object registry. See
+ * notes/single-daemon-refactor.md.
  */
 struct vu_media_ctx {
+    /*
+     * Controlling loop, run by the main thread. It exists purely to wait for
+     * SIGHUP/SIGINT; the actual vhost-user work runs on each device's own loop.
+     */
     GMainLoop *loop;
 
-    /*
-     * Xen grant device for dma-buf import/export, opened once and shared by
-     * every device's struct vhost_user_media (each media->gntdev_handle points
-     * here). Grant refs are domain-global, so a single handle serves all.
-     */
-    void *gntdev_handle;
+    GList *devices;         /* struct vu_media_device * for every device */
+    GMutex devices_lock;    /* guards devices list (mutated from device threads
+                             * on panic, and from the main thread at teardown) */
 
-    GList *devices; /* struct vu_media_device * for every device */
+    /*
+     * Cross-device shared-object registry: exported dma-buf UUID -> host dma_fd.
+     * A buffer exported by one device (e.g. the decoder) may be looked up by
+     * another (e.g. the encoder) whose command runs on a different thread, so
+     * the lookup path must not walk another device's session/mmap lists. Each
+     * device registers its exported buffers here on MMAP and removes them before
+     * closing the fd; lookups dup() under the lock and hand back an owned fd.
+     * key = g_memdup2'd 16-byte UUID, value = GINT_TO_POINTER(dma_fd).
+     */
+    GHashTable *uuid_registry;
+    GMutex registry_lock;
 };
 
 /*
@@ -364,9 +408,21 @@ static int vu_media_set_config(VuDev *vudev, const uint8_t *data,
 
 static void vu_media_panic(VuDev *vudev, const char *msg)
 {
-    g_critical("vhost-user-media panic: %s", msg);
-    if (vu_ctx.loop)
-        g_main_loop_quit(vu_ctx.loop);
+    struct vu_media_device *dev = vu_media_from_vudev(vudev);
+
+    g_critical("vhost-user-media panic on %s: %s",
+               dev->media.v4l2_device ? dev->media.v4l2_device : "?", msg);
+
+    /*
+     * Isolate the failure to this device: quit only its own loop so its thread
+     * returns and the main thread can reap it, leaving the other devices
+     * running. The daemon stays up. Actual teardown (vug_deinit, frees) happens
+     * on the main thread, not here, to avoid tearing down the loop from inside
+     * its own callback.
+     */
+    dev->panicked = TRUE;
+    if (dev->loop)
+        g_main_loop_quit(dev->loop);
 }
 
 /*
@@ -381,24 +437,51 @@ static uint64_t vu_media_get_protocol_features(VuDev *vudev)
     return 1ULL << VHOST_USER_PROTOCOL_F_SHARED_OBJECT;
 }
 
-/*
- * Search every device in this process for a live buffer carrying `uuid` and
- * return its owning device's dma_fd (NOT dup'd; the caller must not close it),
- * or -1 if none has it. Shared by the QEMU-facing producer callback and the
- * consumer-side local fast path.
- */
-static int vu_ctx_lookup_shared_object(const uint8_t *uuid)
+/* FNV-1a over the 16-byte UUID; keys are g_memdup2'd 16-byte blobs. */
+static guint uuid_hash(gconstpointer key)
 {
-    GList *l;
+    const uint8_t *u = key;
+    guint h = 2166136261u;
+    int i;
 
-    for (l = vu_ctx.devices; l; l = l->next) {
-        struct vu_media_device *dev = l->data;
-        int fd = vhost_media_lookup_shared_object(&dev->media, uuid);
-
-        if (fd >= 0)
-            return fd;
+    for (i = 0; i < 16; i++) {
+        h ^= u[i];
+        h *= 16777619u;
     }
-    return -1;
+    return h;
+}
+
+static gboolean uuid_equal(gconstpointer a, gconstpointer b)
+{
+    return memcmp(a, b, 16) == 0;
+}
+
+/*
+ * Register an exported buffer's UUID -> dma_fd in the process-wide registry.
+ * Called (via media->shared_register) right after a device exports a host
+ * buffer on MMAP. The registry does NOT own the fd; the producer device's MMAP
+ * entry does, and it removes the entry (vu_media_shared_unregister) before
+ * closing the fd, so a locked lookup always sees a still-valid fd.
+ */
+static void vu_media_shared_register(struct vhost_user_media *m,
+                                     const uint8_t uuid[16], int dma_fd)
+{
+    g_mutex_lock(&vu_ctx.registry_lock);
+    g_hash_table_insert(vu_ctx.uuid_registry, g_memdup2(uuid, 16),
+                        GINT_TO_POINTER(dma_fd));
+    g_mutex_unlock(&vu_ctx.registry_lock);
+}
+
+/*
+ * Remove a UUID from the registry (via media->shared_unregister), called before
+ * the producer closes the underlying dma_fd on munmap / session teardown.
+ */
+static void vu_media_shared_unregister(struct vhost_user_media *m,
+                                       const uint8_t uuid[16])
+{
+    g_mutex_lock(&vu_ctx.registry_lock);
+    g_hash_table_remove(vu_ctx.uuid_registry, uuid);
+    g_mutex_unlock(&vu_ctx.registry_lock);
 }
 
 /*
@@ -409,14 +492,27 @@ static int vu_ctx_lookup_shared_object(const uint8_t *uuid)
  * requesting consumer daemon, so we must NOT close it here (its lifetime is
  * the MMAP entry's). Returns -1 if no live buffer carries this UUID.
  *
- * With several devices in one process the UUID may have been registered by a
- * different device than the one QEMU routed this request to (e.g. the decoder
- * produced the buffer, the encoder consumes it), so search every device's
- * media until one resolves the UUID.
+ * Queries the process-wide registry under the lock rather than walking any
+ * device's session/mmap lists: this callback runs on the producer device's
+ * thread, but another device's thread may be concurrently mutating its own
+ * lists, so a direct walk would race. The registry maps UUID -> the producer's
+ * original dma_fd, and unregister (which takes the same lock) precedes the
+ * producer closing the fd, so an entry still in the table has a live fd. We
+ * return that borrowed fd without dup'ing -- libvhost-user copies it via
+ * SCM_RIGHTS and never closes our copy.
  */
 static int vu_media_get_shared_object(VuDev *vudev, const unsigned char *uuid)
 {
-    int fd = vu_ctx_lookup_shared_object(uuid);
+    gpointer val;
+    gboolean found;
+    int fd = -1;
+
+    g_mutex_lock(&vu_ctx.registry_lock);
+    found = g_hash_table_lookup_extended(vu_ctx.uuid_registry, uuid,
+                                         NULL, &val);
+    if (found)
+        fd = GPOINTER_TO_INT(val);
+    g_mutex_unlock(&vu_ctx.registry_lock);
 
     if (fd < 0)
         g_warning("get_shared_object: no live buffer for requested UUID");
@@ -428,13 +524,36 @@ static int vu_media_get_shared_object(VuDev *vudev, const unsigned char *uuid)
  * UUID against buffers exported by any device in this process, in-address-space,
  * so a consumer (e.g. encoder) never issues the synchronous cross-process RPC
  * for a producer (e.g. decoder) that lives in this same daemon -- which would
- * deadlock the shared main loop. Returns the producer's dma_fd (caller dup's
- * it) or -1 on a local miss (the producer is another process; RPC is safe).
+ * deadlock (the RPC blocks the calling device's loop waiting on a reply that
+ * QEMU can only get by asking the producer device, potentially serialized
+ * behind us).
+ *
+ * Runs on the consumer device's thread while the producer runs on another, so
+ * it must not touch the producer's lists directly: it queries the locked
+ * registry and dup()s the fd while holding the lock. Because unregister (which
+ * precedes the producer closing the fd) also takes the lock, an entry still in
+ * the table is guaranteed to have a live fd. Returns a NEW fd owned by the
+ * caller (which must close it), or -1 on a local miss (the producer is another
+ * process; the cross-process RPC is then safe).
  */
 static int vu_media_local_lookup(struct vhost_user_media *m,
                                  const uint8_t uuid[16])
 {
-    return vu_ctx_lookup_shared_object(uuid);
+    gpointer val;
+    gboolean found;
+    int fd = -1;
+
+    g_mutex_lock(&vu_ctx.registry_lock);
+    found = g_hash_table_lookup_extended(vu_ctx.uuid_registry, uuid,
+                                         NULL, &val);
+    if (found) {
+        fd = dup(GPOINTER_TO_INT(val));
+        if (fd < 0)
+            g_warning("local_lookup: dup failed: %s", g_strerror(errno));
+    }
+    g_mutex_unlock(&vu_ctx.registry_lock);
+
+    return fd;
 }
 
 static const VuDevIface vuiface = {
@@ -461,17 +580,29 @@ session_poll_callback(gint fd, GIOCondition condition,
 }
 
 /*
- * Register a session's V4L2 fd for polling in the GLib main loop.
+ * Register a session's V4L2 fd for polling on the owning device's main loop.
+ *
+ * The source is attached to the device's own GMainContext (not the global
+ * default one) so it runs on that device's thread, keeping devices isolated.
+ * This runs from the device thread (register_poll is invoked while handling a
+ * command), so dev->context is that thread's thread-default context. We keep an
+ * explicit GSource* (s->poll_source) rather than a source id because the source
+ * lives on a non-default context and must be removed with
+ * g_source_destroy()/g_source_unref() (see session_clear_poll).
  */
 static void vu_media_register_poll(struct vhost_user_media *m,
                                    struct media_session *s)
 {
-    s->poll_source_id = g_unix_fd_add(s->v4l2_fd,
-                                      G_IO_IN | G_IO_OUT | G_IO_PRI |
-                                      G_IO_ERR | G_IO_HUP,
-                                      session_poll_callback, s);
-    g_debug("Registered poll for session %u (fd=%d, source=%u)",
-            s->id, s->v4l2_fd, s->poll_source_id);
+    struct vu_media_device *dev = vu_media_from_media(m);
+    GSource *src = g_unix_fd_source_new(s->v4l2_fd,
+                                        G_IO_IN | G_IO_OUT | G_IO_PRI |
+                                        G_IO_ERR | G_IO_HUP);
+
+    g_source_set_callback(src, (GSourceFunc)(void (*)(void))session_poll_callback,
+                          s, NULL);
+    g_source_attach(src, dev->context);
+    s->poll_source = src;
+    g_debug("Registered poll for session %u (fd=%d)", s->id, s->v4l2_fd);
 }
 
 static gboolean hangup(gpointer data)
@@ -482,23 +613,86 @@ static gboolean hangup(gpointer data)
 }
 
 /*
+ * Device thread entry point. vug_init and g_main_loop_run must both run here so
+ * that (a) the vhost-user socket GSource created inside vug_init attaches to
+ * this device's context -- vug_source_new attaches to the thread-default
+ * context -- and (b) the loop is serviced by this thread alone, isolating the
+ * device. We push dev->context as the thread-default before vug_init, signal
+ * the outcome back to vu_media_device_new via init_done/init_ok, and only enter
+ * the loop if vug_init succeeded.
+ */
+static gpointer vu_media_device_thread(gpointer data)
+{
+    struct vu_media_device *dev = data;
+    gboolean ok;
+
+    g_main_context_push_thread_default(dev->context);
+
+    /*
+     * vug_init takes ownership of dev->socket_fd: vug_deinit closes it. The fd
+     * is our own (dup'd out of the transient GSocket by the caller), so this is
+     * the single owner.
+     */
+    ok = vug_init(&dev->dev, VHOST_USER_MEDIA_MAX_QUEUES,
+                  dev->socket_fd, vu_media_panic, &vuiface);
+    if (!ok) {
+        g_printerr("Failed to initialize libvhost-user-glib for %s\n",
+                   dev->media.v4l2_device);
+        close(dev->socket_fd);
+    } else {
+        dev->initialized = TRUE;
+    }
+
+    g_mutex_lock(&dev->init_lock);
+    dev->init_ok = ok;
+    dev->init_done = TRUE;
+    g_cond_signal(&dev->init_cond);
+    g_mutex_unlock(&dev->init_lock);
+
+    if (!ok) {
+        g_main_context_pop_thread_default(dev->context);
+        return NULL;
+    }
+
+    g_main_loop_run(dev->loop);
+
+    g_main_context_pop_thread_default(dev->context);
+    return NULL;
+}
+
+/*
  * Bring up one device: allocate its state, take ownership of the connected
- * socket, wire the media callbacks and shared grant handle, and hand the socket
- * to libvhost-user. On success the device is appended to ctx->devices and 0 is
+ * socket, wire the media callbacks, open its own Xen grant handle, create its
+ * own GMainContext + GMainLoop, and start its thread (which runs vug_init and
+ * the loop). On success the device is appended to ctx->devices and 0 is
  * returned; on failure everything allocated here is torn down and -1 returned.
  */
 static int vu_media_device_new(struct vu_media_ctx *ctx,
                                const char *v4l2_device, int socket_fd)
 {
     struct vu_media_device *dev = g_new0(struct vu_media_device, 1);
+    gboolean ok;
 
     dev->ctx = ctx;
+    dev->socket_fd = socket_fd;
     dev->media.v4l2_device = g_strdup(v4l2_device);
     dev->media.send_event = vu_media_send_event;
     dev->media.register_poll = vu_media_register_poll;
     dev->media.local_lookup = vu_media_local_lookup;
-    /* Every device shares the one process-wide Xen grant device handle. */
-    dev->media.gntdev_handle = ctx->gntdev_handle;
+    dev->media.shared_register = vu_media_shared_register;
+    dev->media.shared_unregister = vu_media_shared_unregister;
+
+    /*
+     * Each device opens its own Xen grant device handle. dma-buf fds are
+     * process-global objects independent of the handle, so this only isolates
+     * the handle itself; the cost is negligible and it keeps devices from
+     * sharing mutable state through the handle.
+     */
+    dev->media.gntdev_handle = xengnttab_open(NULL, 0);
+    if (!dev->media.gntdev_handle) {
+        g_printerr("Failed to open Xen grant device for %s\n", v4l2_device);
+        goto err_free;
+    }
 
     dev->pending_events = g_queue_new();
 
@@ -508,36 +702,75 @@ static int vu_media_device_new(struct vu_media_ctx *ctx,
     dev->resp_buf_size = VU_MEDIA_RESP_BUF_SIZE;
     dev->resp_buf = g_malloc(dev->resp_buf_size);
 
-    /*
-     * vug_init takes ownership of socket_fd: vu_deinit (via vug_deinit in
-     * vu_media_device_free) closes it. The fd is our own (dup'd out of the
-     * transient GSocket by the caller), so this is the single owner.
-     */
-    if (!vug_init(&dev->dev, VHOST_USER_MEDIA_MAX_QUEUES,
-                  socket_fd, vu_media_panic, &vuiface)) {
-        g_printerr("Failed to initialize libvhost-user-glib for %s\n",
-                   v4l2_device);
-        close(socket_fd);
+    /* Per-device event loop, run on its own thread for fault isolation. */
+    dev->context = g_main_context_new();
+    dev->loop = g_main_loop_new(dev->context, FALSE);
+    g_mutex_init(&dev->init_lock);
+    g_cond_init(&dev->init_cond);
+
+    /* Publish the device before starting its thread: the thread may call back
+     * (panic) and cross-device lookups may race, both of which expect it on the
+     * list. Guarded by devices_lock. */
+    g_mutex_lock(&ctx->devices_lock);
+    ctx->devices = g_list_append(ctx->devices, dev);
+    g_mutex_unlock(&ctx->devices_lock);
+
+    dev->thread = g_thread_new(v4l2_device, vu_media_device_thread, dev);
+
+    /* Wait for the thread to attempt vug_init so we can report success now. */
+    g_mutex_lock(&dev->init_lock);
+    while (!dev->init_done)
+        g_cond_wait(&dev->init_cond, &dev->init_lock);
+    ok = dev->init_ok;
+    g_mutex_unlock(&dev->init_lock);
+
+    if (!ok) {
+        /* Thread has exited (vug_init failed, socket_fd already closed there).
+         * Reap it and tear the device down. */
+        g_thread_join(dev->thread);
+        dev->thread = NULL;
+        g_mutex_lock(&ctx->devices_lock);
+        ctx->devices = g_list_remove(ctx->devices, dev);
+        g_mutex_unlock(&ctx->devices_lock);
+        g_main_loop_unref(dev->loop);
+        g_main_context_unref(dev->context);
+        g_cond_clear(&dev->init_cond);
+        g_mutex_clear(&dev->init_lock);
         g_free(dev->cmd_buf);
         g_free(dev->resp_buf);
         g_queue_free(dev->pending_events);
+        xengnttab_close(dev->media.gntdev_handle);
         g_free(dev->media.v4l2_device);
         g_free(dev);
         return -1;
     }
 
-    ctx->devices = g_list_append(ctx->devices, dev);
     g_message("vhost-user-media: device=%s ready", v4l2_device);
     return 0;
+
+err_free:
+    g_free(dev->media.v4l2_device);
+    g_free(dev);
+    close(socket_fd);
+    return -1;
 }
 
 /*
- * Tear down one device: destroy its sessions, drain its grant-release pool,
- * deinit libvhost-user and free its buffers. The shared grant handle lives in
- * the ctx and is closed once, after all devices are gone.
+ * Tear down one device: stop its loop and join its thread, destroy its
+ * sessions, drain its grant-release pool, deinit libvhost-user, close its Xen
+ * grant handle and free its buffers. Must run on the main thread (not the
+ * device's own thread).
  */
 static void vu_media_device_free(struct vu_media_device *dev)
 {
+    /* Stop the device thread's loop and wait for it to return. If the device
+     * panicked it already quit its own loop; quitting again is harmless. */
+    if (dev->thread) {
+        g_main_loop_quit(dev->loop);
+        g_thread_join(dev->thread);
+        dev->thread = NULL;
+    }
+
     while (dev->media.sessions) {
         struct media_session *s = dev->media.sessions->data;
         vhost_media_destroy_session(&dev->media, s);
@@ -547,11 +780,20 @@ static void vu_media_device_free(struct vu_media_device *dev)
     if (dev->media.grant_release_pool)
         g_thread_pool_free(dev->media.grant_release_pool, FALSE, TRUE);
 
-    vug_deinit(&dev->dev);
+    if (dev->initialized)
+        vug_deinit(&dev->dev);
 
     while (!g_queue_is_empty(dev->pending_events))
         g_free(g_queue_pop_head(dev->pending_events));
     g_queue_free(dev->pending_events);
+
+    g_main_loop_unref(dev->loop);
+    g_main_context_unref(dev->context);
+    g_cond_clear(&dev->init_cond);
+    g_mutex_clear(&dev->init_lock);
+
+    if (dev->media.gntdev_handle)
+        xengnttab_close(dev->media.gntdev_handle);
 
     g_free(dev->cmd_buf);
     g_free(dev->resp_buf);
@@ -737,14 +979,24 @@ int main(int argc, char *argv[])
 
     memset(&vu_ctx, 0, sizeof(vu_ctx));
 
-    /* Open the Xen grant device once; every device shares this handle. */
-    vu_ctx.gntdev_handle = xengnttab_open(NULL, 0);
-    if (!vu_ctx.gntdev_handle) {
-        g_printerr("Failed to open xengnttab device\n");
-        exit(EXIT_FAILURE);
-    }
+    /*
+     * Process-wide UUID -> dma-buf fd registry, keyed by a copy of the 16-byte
+     * UUID. Producers register on MMAP export and unregister on release; a
+     * consumer device resolving a UUID exported by another device looks it up
+     * here (under registry_lock) and gets an owned dup. This decouples the
+     * cross-device lookup from each device's own sessions/mmaps lists, which
+     * are mutated only on that device's own thread.
+     */
+    vu_ctx.uuid_registry = g_hash_table_new_full(uuid_hash, uuid_equal,
+                                                 g_free, NULL);
+    g_mutex_init(&vu_ctx.registry_lock);
+    g_mutex_init(&vu_ctx.devices_lock);
 
-    /* Shared main loop for every device. */
+    /*
+     * Main-thread control loop. Each device runs its own loop on its own
+     * thread; this one only waits for termination signals so the process can
+     * shut every device down cleanly.
+     */
     vu_ctx.loop = g_main_loop_new(NULL, FALSE);
     g_unix_signal_add(SIGHUP, hangup, vu_ctx.loop);
     g_unix_signal_add(SIGINT, hangup, vu_ctx.loop);
@@ -800,12 +1052,15 @@ int main(int argc, char *argv[])
     g_message("Main loop exited, cleaning up");
     g_main_loop_unref(vu_ctx.loop);
 
-    /* Tear down every device before closing the shared grant handle. */
+    /*
+     * Tear down every device: each stops its own loop, joins its thread and
+     * closes its own Xen grant handle inside vu_media_device_free.
+     */
     g_list_free_full(vu_ctx.devices, (GDestroyNotify)vu_media_device_free);
 
-    /* Close the shared Xen grant device */
-    if (vu_ctx.gntdev_handle)
-        xengnttab_close(vu_ctx.gntdev_handle);
+    g_hash_table_destroy(vu_ctx.uuid_registry);
+    g_mutex_clear(&vu_ctx.registry_lock);
+    g_mutex_clear(&vu_ctx.devices_lock);
 
     return 0;
 }
