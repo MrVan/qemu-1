@@ -24,6 +24,33 @@
 #include <xenforeignmemory.h>
 #include <xengnttab.h>
 
+/*
+ * Process-wide cache of foreign-mapped guest RAM regions.
+ *
+ * A single vhost-user-media daemon now drives several virtio-media devices,
+ * one VuDev per device.  Every VuDev negotiates the guest memory table and
+ * asks to foreign-map the guest RAM, but for a given DomU that is the *same*
+ * physical range (same domid/gpa/size) for all of them.  Mapping it once per
+ * device multiplies the Dom0 foreign-map pressure by the device count and, at
+ * four devices, exhausts it (xenforeignmemory_map2 fails -> vring addr NULL ->
+ * panic -> DomU hangs).
+ *
+ * Map each unique (domid, gpa, size) region exactly once and hand the same VA
+ * back to every device, reference-counted.  The mapping (and its Xen handle)
+ * is torn down only when the last device drops its reference.
+ */
+typedef struct VuXenForeignMap {
+    uint32_t domainid;
+    uint64_t addr;
+    uint64_t size;
+    void *ramptr;
+    xenforeignmemory_handle *handle;
+    unsigned int refcount;
+} VuXenForeignMap;
+
+static GSList *vu_xen_foreignmaps;
+static GMutex vu_xen_foreignmap_lock;
+
 void *vu_xen_foreignmap(uint32_t domainid, uint64_t addr, uint64_t size)
 {
     xenforeignmemory_handle * vu_foreignmap_handle = NULL;
@@ -33,6 +60,25 @@ void *vu_xen_foreignmap(uint32_t domainid, uint64_t addr, uint64_t size)
     xen_pfn_t address_index = addr >> XC_PAGE_SHIFT;
     int *err;
     int i;
+    VuXenForeignMap *entry;
+    GSList *l;
+
+    g_mutex_lock(&vu_xen_foreignmap_lock);
+
+    /* Reuse an existing mapping of the same guest range if present. */
+    for (l = vu_xen_foreignmaps; l; l = l->next) {
+        entry = l->data;
+        if (entry->domainid == domainid && entry->addr == addr &&
+            entry->size == size) {
+            entry->refcount++;
+            ramptr = entry->ramptr;
+            g_mutex_unlock(&vu_xen_foreignmap_lock);
+            DPRINT("xen foreign map reuse domain[%d]: gpa %016"PRIx64
+                   " size %016"PRIx64" va addr %p refcount %u\n",
+                   domainid, addr, size, ramptr, entry->refcount);
+            return ramptr;
+        }
+    }
 
     pfns = g_new0(xen_pfn_t, nb_pfn);
     err = g_new0(int, nb_pfn);
@@ -44,6 +90,9 @@ void *vu_xen_foreignmap(uint32_t domainid, uint64_t addr, uint64_t size)
     vu_foreignmap_handle = xenforeignmemory_open(NULL,0);
     if (!vu_foreignmap_handle) {
         DPRINT("xenforeignmemory_open failure\n");
+        g_free(pfns);
+        g_free(err);
+        g_mutex_unlock(&vu_xen_foreignmap_lock);
         return NULL;
     }
 
@@ -51,13 +100,83 @@ void *vu_xen_foreignmap(uint32_t domainid, uint64_t addr, uint64_t size)
                                    PROT_READ | PROT_WRITE, 0, nb_pfn, pfns, err);
     if (!ramptr) {
         DPRINT("xenforeignmemory_map2 fail\n");
+        xenforeignmemory_close(vu_foreignmap_handle);
+        g_free(pfns);
+        g_free(err);
+        g_mutex_unlock(&vu_xen_foreignmap_lock);
         return NULL;
     }
+
+    entry = g_new0(VuXenForeignMap, 1);
+    entry->domainid = domainid;
+    entry->addr = addr;
+    entry->size = size;
+    entry->ramptr = ramptr;
+    entry->handle = vu_foreignmap_handle;
+    entry->refcount = 1;
+    vu_xen_foreignmaps = g_slist_prepend(vu_xen_foreignmaps, entry);
+
+    g_free(pfns);
+    g_free(err);
+    g_mutex_unlock(&vu_xen_foreignmap_lock);
 
     DPRINT("xen foreign map domain[%d]: gpa %016"PRIx64" size %016"PRIx64" va addr %p\n",
            domainid, addr, size, ramptr);
 
     return ramptr;
+}
+
+/*
+ * Drop one reference to a shared foreign mapping identified by its VA.  The
+ * mapping is unmapped and its Xen handle closed only when the final reference
+ * is released.  Returns true if it handled the address (i.e. it was a shared
+ * foreign mapping); the caller then must not munmap() it itself.
+ */
+static bool vu_xen_foreign_unmap(void *ramptr, uint64_t size)
+{
+    VuXenForeignMap *entry;
+    GSList *l;
+
+    g_mutex_lock(&vu_xen_foreignmap_lock);
+
+    for (l = vu_xen_foreignmaps; l; l = l->next) {
+        entry = l->data;
+        if (entry->ramptr == ramptr) {
+            if (--entry->refcount > 0) {
+                g_mutex_unlock(&vu_xen_foreignmap_lock);
+                DPRINT("xen foreign unmap defer va %p refcount %u\n",
+                       ramptr, entry->refcount);
+                return true;
+            }
+            vu_xen_foreignmaps = g_slist_remove(vu_xen_foreignmaps, entry);
+            g_mutex_unlock(&vu_xen_foreignmap_lock);
+
+            munmap(ramptr, size);
+            xenforeignmemory_close(entry->handle);
+            DPRINT("xen foreign unmap release va %p size %016"PRIx64"\n",
+                   ramptr, size);
+            g_free(entry);
+            return true;
+        }
+    }
+
+    g_mutex_unlock(&vu_xen_foreignmap_lock);
+    return false;
+}
+
+/*
+ * Unmap a guest RAM region previously mapped for this VuDev.  Under Xen the
+ * region is a reference-counted shared foreign mapping, so this releases our
+ * reference and only tears the mapping down when the last device drops it.
+ * Regions that were not shared foreign mappings fall back to a plain munmap().
+ * Installed as the region's unmap callback at map time, so the generic core
+ * tears the region down without ever referencing Xen code.
+ */
+static void vu_xen_unmap_region(void *ramptr, uint64_t size)
+{
+    if (!vu_xen_foreign_unmap(ramptr, size)) {
+        munmap(ramptr, size);
+    }
 }
 
 bool vu_xen_add_mem_reg(VuDev *dev, VhostUserMsg *vmsg)
@@ -103,6 +222,7 @@ bool vu_xen_add_mem_reg(VuDev *dev, VhostUserMsg *vmsg)
                domid, dev_region->gpa, dev_region->size);
         return false;
     }
+    dev_region->unmap = vu_xen_unmap_region;
 
     DPRINT("dev->max_queues %d\n", dev->max_queues);
     for (i = 0; i < dev->max_queues; i++) {

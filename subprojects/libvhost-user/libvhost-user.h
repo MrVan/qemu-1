@@ -248,6 +248,14 @@ typedef struct VuDevRegion {
     uint64_t mmap_addr;
     /* Xen: Vhost virtual address (userspace). */
     uint64_t vva;
+    /*
+     * How to release this region's mapping. Set when the region is mapped so
+     * that the generic teardown paths stay agnostic of how it was mapped: the
+     * default is a plain munmap(), while a Xen foreign mapping installs its own
+     * reference-counted release. Keeps the mapping backend an injected
+     * dependency instead of the core reaching into it.
+     */
+    void (*unmap)(void *ramptr, uint64_t size);
 } VuDevRegion;
 
 typedef struct VuDev VuDev;

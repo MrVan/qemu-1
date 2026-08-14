@@ -265,6 +265,12 @@ qva_to_va(VuDev *dev, uint64_t qemu_addr)
 }
 
 static void
+vu_default_unmap_region(void *ramptr, uint64_t size)
+{
+    munmap(ramptr, size);
+}
+
+static void
 vu_remove_all_mem_regs(VuDev *dev)
 {
     unsigned int i;
@@ -272,7 +278,7 @@ vu_remove_all_mem_regs(VuDev *dev)
     for (i = 0; i < dev->nregions; i++) {
         VuDevRegion *r = &dev->regions[i];
 
-        munmap((void *)(uintptr_t)r->mmap_addr, r->size + r->mmap_offset);
+        r->unmap((void *)(uintptr_t)r->mmap_addr, r->size + r->mmap_offset);
     }
     dev->nregions = 0;
 }
@@ -475,6 +481,7 @@ _vu_add_mem_reg(VuDev *dev, VhostUserMemoryRegion *msg_region, int fd)
     r->qva = msg_region->userspace_addr;
     r->mmap_addr = (uint64_t)(uintptr_t)mmap_addr;
     r->mmap_offset = mmap_offset;
+    r->unmap = vu_default_unmap_region;
     dev->nregions++;
 
     if (dev->postcopy_listening) {
@@ -1057,7 +1064,7 @@ vu_rem_mem_reg(VuDev *dev, VhostUserMsg *vmsg) {
      */
     unmap_rings(dev, r);
 
-    munmap((void *)(uintptr_t)r->mmap_addr, r->size + r->mmap_offset);
+    r->unmap((void *)(uintptr_t)r->mmap_addr, r->size + r->mmap_offset);
 
     idx = r - dev->regions;
     assert(idx < dev->nregions);
