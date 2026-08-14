@@ -42,6 +42,16 @@
 #define VIRTIO_MEDIA_MAX_PLANES VIDEO_MAX_PLANES
 
 /*
+ * Maximum number of grant-ref pages a single MMAP response can carry. Must
+ * match the guest driver's VIRTIO_MEDIA_MAX_MAPPING_PAGES: the guest sizes its
+ * device-writable entries buffer to this, and the backend sizes its response
+ * buffer to hold this many grant refs. A 4K NV12 CAPTURE plane (VPU
+ * tile-aligned) needs ~2176 pages, so a smaller cap would fail 4K with
+ * -ENOSPC.
+ */
+#define VIRTIO_MEDIA_MAX_MAPPING_PAGES 4096
+
+/*
  * Command/Response headers.
  */
 struct virtio_media_cmd_header {

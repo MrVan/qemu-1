@@ -48,7 +48,32 @@ struct vu_media_device {
      * the eventq.
      */
     GQueue *pending_events;
+
+    /*
+     * Persistent command/response scratch buffers, allocated once at startup
+     * and reused for every command. Sized for the worst case (an MMAP response
+     * carrying VIRTIO_MEDIA_MAX_MAPPING_PAGES grant refs) so 4K buffers no
+     * longer overflow, while avoiding a malloc/free per command.
+     */
+    uint8_t *cmd_buf;
+    size_t cmd_buf_size;
+    uint8_t *resp_buf;
+    size_t resp_buf_size;
 };
+
+/*
+ * Command buffer size. Commands (OPEN/IOCTL/MMAP/...) are small; 8 KiB matches
+ * the historical bound and comfortably holds the largest ioctl payload.
+ */
+#define VU_MEDIA_CMD_BUF_SIZE 8192
+
+/*
+ * Response buffer size. The MMAP response is the largest: a fixed header plus
+ * up to VIRTIO_MEDIA_MAX_MAPPING_PAGES 32-bit grant refs.
+ */
+#define VU_MEDIA_RESP_BUF_SIZE \
+    (sizeof(struct virtio_media_resp_mmap) + \
+     VIRTIO_MEDIA_MAX_MAPPING_PAGES * sizeof(uint32_t))
 
 /* A single event awaiting an available eventq buffer. */
 struct pending_event {
@@ -148,22 +173,22 @@ static void vu_media_handle_commandq(VuDev *vudev, int qidx)
 
     while ((elem = vu_queue_pop(vudev, vq, sizeof(VuVirtqElement)))) {
         /* Gather the device-readable (command) data */
-        uint8_t cmd_buf[8192];
+        uint8_t *cmd_buf = vu_media.cmd_buf;
         size_t cmd_len = 0;
         int i;
 
-        for (i = 0; i < elem->out_num && cmd_len < sizeof(cmd_buf); i++) {
+        for (i = 0; i < elem->out_num && cmd_len < vu_media.cmd_buf_size; i++) {
             size_t chunk = elem->out_sg[i].iov_len;
-            if (cmd_len + chunk > sizeof(cmd_buf))
-                chunk = sizeof(cmd_buf) - cmd_len;
+            if (cmd_len + chunk > vu_media.cmd_buf_size)
+                chunk = vu_media.cmd_buf_size - cmd_len;
             memcpy(cmd_buf + cmd_len, elem->out_sg[i].iov_base, chunk);
             cmd_len += chunk;
         }
 
         /* Prepare response buffer */
-        uint8_t resp_buf[8192];
+        uint8_t *resp_buf = vu_media.resp_buf;
         size_t resp_len = 0;
-        size_t resp_buf_size = sizeof(resp_buf);
+        size_t resp_buf_size = vu_media.resp_buf_size;
 
         /* Also calculate available device-writable space */
         size_t in_total = 0;
@@ -405,6 +430,12 @@ int main(int argc, char *argv[])
 
     vu_media.pending_events = g_queue_new();
 
+    /* Allocate the persistent command/response scratch buffers once. */
+    vu_media.cmd_buf_size = VU_MEDIA_CMD_BUF_SIZE;
+    vu_media.cmd_buf = g_malloc(vu_media.cmd_buf_size);
+    vu_media.resp_buf_size = VU_MEDIA_RESP_BUF_SIZE;
+    vu_media.resp_buf = g_malloc(vu_media.resp_buf_size);
+
     /* Open Xen grant device for dma-buf import/export */
     vu_media.media.gntdev_handle = xengnttab_open(NULL, 0);
     if (!vu_media.media.gntdev_handle) {
@@ -477,6 +508,9 @@ int main(int argc, char *argv[])
     /* Close Xen grant device */
     if (vu_media.media.gntdev_handle)
         xengnttab_close(vu_media.media.gntdev_handle);
+
+    g_free(vu_media.cmd_buf);
+    g_free(vu_media.resp_buf);
 
     return 0;
 }
