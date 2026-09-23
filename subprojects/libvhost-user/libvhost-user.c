@@ -768,7 +768,7 @@ vu_kick_cb(VuDev *dev, int condition, void *data)
         vu_panic(dev, "kick eventfd_read(): %s", strerror(errno));
         dev->remove_watch(dev, dev->vq[index].kick_fd);
     } else {
-        DPRINT("Got kick_data: %016"PRIx64" handler:%p idx:%d\n",
+        DPRINT_HOT("Got kick_data: %016"PRIx64" handler:%p idx:%d\n",
                kick_data, vq->handler, index);
         if (vq->handler) {
             vq->handler(dev, index);
@@ -2054,7 +2054,7 @@ vu_handle_vring_kick(VuDev *dev, VhostUserMsg *vmsg)
         return false;
     }
 
-    DPRINT("Got kick message: handler:%p idx:%u\n",
+    DPRINT_HOT("Got kick message: handler:%p idx:%u\n",
            dev->vq[index].handler, index);
 
     if (!dev->vq[index].started) {
@@ -2087,19 +2087,19 @@ vu_process_message(VuDev *dev, VhostUserMsg *vmsg)
     int do_reply = 0;
 
     /* Print out generic part of the request. */
-    DPRINT("================ Vhost user message ================\n");
-    DPRINT("Request: %s (%d)\n", vu_request_to_string(vmsg->request),
+    DPRINT_HOT("================ Vhost user message ================\n");
+    DPRINT_HOT("Request: %s (%d)\n", vu_request_to_string(vmsg->request),
            vmsg->request);
-    DPRINT("Flags:   0x%x\n", vmsg->flags);
-    DPRINT("Size:    %u\n", vmsg->size);
+    DPRINT_HOT("Flags:   0x%x\n", vmsg->flags);
+    DPRINT_HOT("Size:    %u\n", vmsg->size);
 
     if (vmsg->fd_num) {
         int i;
-        DPRINT("Fds:");
+        DPRINT_HOT("Fds:");
         for (i = 0; i < vmsg->fd_num; i++) {
-            DPRINT(" %d", vmsg->fds[i]);
+            DPRINT_HOT(" %d", vmsg->fds[i]);
         }
-        DPRINT("\n");
+        DPRINT_HOT("\n");
     }
 
     if (dev->iface->process_msg &&
@@ -2152,6 +2152,8 @@ vu_process_message(VuDev *dev, VhostUserMsg *vmsg)
         return vu_set_config(dev, vmsg);
     case VHOST_USER_NONE:
         /* if you need processing before exit, override iface->process_msg */
+        fprintf(stderr, "vhost-user: received VHOST_USER_NONE (0), "
+                "frontend closed connection; daemon exiting\n");
         exit(0);
     case VHOST_USER_POSTCOPY_ADVISE:
         return vu_set_postcopy_advise(dev, vmsg);
@@ -2647,7 +2649,7 @@ static void _vu_queue_notify(VuDev *dev, VuVirtq *vq, bool sync)
     }
 
     if (!vring_notify(dev, vq)) {
-        DPRINT("skipped notify...\n");
+        DPRINT_HOT("skipped notify...\n");
         return;
     }
 

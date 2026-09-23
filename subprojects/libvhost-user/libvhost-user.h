@@ -50,6 +50,24 @@
         }                                       \
     } while (0)
 
+/*
+ * Per-kick tracing, split out of DPRINT: these fire on every virtqueue kick --
+ * i.e. several lines per video frame -- and swamp the log while the setup-time
+ * DPRINT messages are still wanted. Off unless the build passes
+ * -DLIBVHOST_USER_DEBUG_HOT=1. The if(0) (rather than #ifdef) keeps the format
+ * strings under compiler check and lets the optimiser drop the call entirely.
+ */
+#ifndef LIBVHOST_USER_DEBUG_HOT
+#define LIBVHOST_USER_DEBUG_HOT 0
+#endif
+
+#define DPRINT_HOT(...)                         \
+    do {                                        \
+        if (LIBVHOST_USER_DEBUG_HOT) {          \
+            fprintf(stderr, __VA_ARGS__);       \
+        }                                       \
+    } while (0)
+
 typedef enum VhostSetConfigType {
     VHOST_SET_CONFIG_TYPE_FRONTEND = 0,
     VHOST_SET_CONFIG_TYPE_MIGRATION = 1,
