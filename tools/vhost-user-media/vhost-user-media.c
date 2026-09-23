@@ -146,8 +146,8 @@ static void maybe_register_poll(struct vhost_user_media *m,
         return;
     if (m->register_poll) {
         m->register_poll(m, s);
-        g_message("Session %u: poll registered (OUTPUT streaming + QBUF done)",
-                  s->id);
+        g_debug("Session %u: poll registered (OUTPUT streaming + QBUF done)",
+                s->id);
     }
 }
 
@@ -1896,7 +1896,7 @@ void vhost_media_poll_session(struct vhost_user_media *m,
         enum drain_result r = drain_capture_queue(m, s);
         if (r == DRAIN_COMPLETE && s->poll_source) {
             /* Drain finished on a normal readable poll. */
-            g_message("Session %u: CAPTURE drain complete (EPIPE)", s->id);
+            g_debug("Session %u: CAPTURE drain complete (EPIPE)", s->id);
             session_clear_poll(s);
         } else if (r == DRAIN_ERROR) {
             g_warning("Session %u: CAPTURE DQBUF error: %s",
