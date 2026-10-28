@@ -1802,13 +1802,13 @@ void vhost_media_send_error_event(struct vhost_user_media *m,
  * Result of trying to drain the CAPTURE queue.
  */
 enum drain_result {
-    DRAIN_MORE,      /* dequeued 0+ buffers, queue then returned EAGAIN */
+    DRAIN_MORE,      /* dequeued one buffer (possibly the LAST one), or none (EAGAIN) */
     DRAIN_COMPLETE,  /* DQBUF returned EPIPE: drain finished, decoder idle */
     DRAIN_ERROR,     /* DQBUF failed with an unexpected error */
 };
 
 /*
- * Drain the CAPTURE queue: DQBUF every ready decoded frame and forward it to
+ * Dequeue the CAPTURE buffer: DQBUF one ready decoded frame and forward it to
  * the guest.  The final buffer of a drain carries V4L2_BUF_FLAG_LAST; getting
  * it out to the guest is what lets the guest driver mark is_capture_last and
  * return -EPIPE on subsequent DQBUF, so the application pipeline can stop.
@@ -1818,36 +1818,36 @@ enum drain_result {
  *
  * Returns:
  *   DRAIN_COMPLETE if the drain finished (DQBUF reported EPIPE),
- *   DRAIN_MORE     if it merely ran out of ready buffers (EAGAIN),
+ *   DRAIN_MORE     if it dequeued one buffer (possibly the LAST one), or none (EAGAIN),
  *   DRAIN_ERROR    on any other DQBUF failure.
  */
-static enum drain_result drain_capture_queue(struct vhost_user_media *m,
-                                             struct media_session *s)
+static enum drain_result dequeue_capture_buffer(struct vhost_user_media *m,
+                                               struct media_session *s)
 {
     struct v4l2_buffer vbuf;
     struct v4l2_plane planes[VIDEO_MAX_PLANES];
 
-    for (;;) {
-        memset(&vbuf, 0, sizeof(vbuf));
-        memset(planes, 0, sizeof(planes));
-        vbuf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-        vbuf.memory = s->capture_memory;
-        vbuf.length = VIDEO_MAX_PLANES;
-        vbuf.m.planes = planes;
+    memset(&vbuf, 0, sizeof(vbuf));
+    memset(planes, 0, sizeof(planes));
+    vbuf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+    vbuf.memory = s->capture_memory;
+    vbuf.length = VIDEO_MAX_PLANES;
+    vbuf.m.planes = planes;
 
-        if (ioctl(s->v4l2_fd, VIDIOC_DQBUF, &vbuf) != 0) {
-            if (errno == EAGAIN)
-                return DRAIN_MORE;
-            if (errno == EPIPE)
-                return DRAIN_COMPLETE;
-            return DRAIN_ERROR;
-        }
-
-        g_debug("Session %u: DQBUF capture index=%u flags=0x%x bytesused=%u",
-                s->id, vbuf.index, vbuf.flags,
-                vbuf.m.planes ? vbuf.m.planes[0].bytesused : 0);
-        vhost_media_send_dqbuf_event(m, s->id, &vbuf);
+    if (ioctl(s->v4l2_fd, VIDIOC_DQBUF, &vbuf) != 0) {
+        if (errno == EAGAIN)
+            return DRAIN_MORE;
+        if (errno == EPIPE)
+            return DRAIN_COMPLETE;
+        return DRAIN_ERROR;
     }
+
+    g_debug("Session %u: DQBUF capture index=%u flags=0x%x bytesused=%u",
+            s->id, vbuf.index, vbuf.flags,
+            vbuf.m.planes ? vbuf.m.planes[0].bytesused : 0);
+    vhost_media_send_dqbuf_event(m, s->id, &vbuf);
+
+    return DRAIN_MORE;
 }
 
 /*
@@ -1893,7 +1893,7 @@ void vhost_media_poll_session(struct vhost_user_media *m,
     }
 
     if (events & G_IO_IN) {
-        enum drain_result r = drain_capture_queue(m, s);
+        enum drain_result r = dequeue_capture_buffer(m, s);
         if (r == DRAIN_COMPLETE && s->poll_source) {
             /* Drain finished on a normal readable poll. */
             g_debug("Session %u: CAPTURE drain complete (EPIPE)", s->id);
@@ -1962,7 +1962,7 @@ void vhost_media_poll_session(struct vhost_user_media *m,
      * run timeout, ...) sets q->error, which makes the very next QBUF/DQBUF on
      * that queue return -EIO.  That is the reliable, unambiguous signal and it
      * is handled on the data path: DQBUF EIO is reported as an error event from
-     * the CAPTURE (drain_capture_queue -> DRAIN_ERROR) and OUTPUT loops, and a
+     * the CAPTURE (dequeue_capture_buffer -> DRAIN_ERROR) and OUTPUT loops, and a
      * QBUF EIO is propagated to the guest as the ioctl status.
      *
      * Therefore: ignore bare EPOLLERR here; only EPOLLHUP (real fd teardown)
